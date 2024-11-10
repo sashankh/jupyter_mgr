@@ -17,8 +17,8 @@ templates = Jinja2Templates(directory="templates")
 client = docker.from_env()
 
 # Configuration
-JUPYTER_IMAGE = 'jupyter/datascience-notebook:latest'
-HOST_PORT_START = 8801  # Starting port number
+JUPYTER_IMAGE = 'jupyter/base-notebook:latest'  # Jupyter Notebook image
+HOST_PORT_START = 8822  # Starting port number
 HOST_PORT_END = 8990    # Ending port number
 NOTES_DIR = os.path.abspath('./notebooks')
 CONFIGS_DIR = os.path.abspath('./configs')  # Directory for config files
@@ -45,11 +45,11 @@ def get_available_port():
     raise Exception("No available ports")
 
 def generate_jupyter_config(config_path, frontend_domain):
-    """Generate a JupyterLab config file to allow embedding in iframes."""
+    """Generate a Jupyter Notebook config file to allow embedding in iframes."""
     config_content = f"""
 c = get_config()
 
-# Allow specific origin to embed JupyterLab in an iframe
+# Allow specific origin to embed Jupyter Notebook in an iframe
 c.NotebookApp.allow_origin = '{frontend_domain}'
 c.NotebookApp.allow_credentials = True
 
@@ -67,14 +67,14 @@ c.NotebookApp.tornado_settings = {{
         config_file.write(config_content)
 
 def create_jupyter_container():
-    """Create and start a new JupyterLab Docker container with dynamic config."""
+    """Create and start a new Jupyter Notebook Docker container with dynamic config."""
     token = uuid.uuid4().hex  # Generate a unique token
     port = get_available_port()
 
-    container_name = f'jupyterlab_{uuid.uuid4().hex[:8]}'
+    container_name = f'jupyter_notebook_{uuid.uuid4().hex[:8]}'  # Renamed for clarity
 
     # Generate unique config file path
-    config_filename = f'jupyter_lab_config_{uuid.uuid4().hex[:8]}.py'
+    config_filename = f'jupyter_notebook_config_{uuid.uuid4().hex[:8]}.py'
     config_path = os.path.join(CONFIGS_DIR, config_filename)
     generate_jupyter_config(config_path, FRONTEND_DOMAIN)
 
@@ -83,12 +83,11 @@ def create_jupyter_container():
             JUPYTER_IMAGE,
             detach=True,
             environment={
-                'JUPYTER_ENABLE_LAB': 'yes',
                 'JUPYTER_TOKEN': token
             },
             volumes={
                 NOTES_DIR: {'bind': '/home/jovyan/work', 'mode': 'rw'},
-                config_path: {'bind': '/home/jovyan/.jupyter/jupyter_lab_config.py', 'mode': 'ro'}
+                config_path: {'bind': '/home/jovyan/.jupyter/jupyter_notebook_config.py', 'mode': 'ro'}
             },
             ports={'8888/tcp': port},
             name=container_name,
@@ -103,7 +102,7 @@ def create_jupyter_container():
     return {
         'container_id': container.id,
         'name': container.name,
-        'url': f'http://localhost:{port}/lab?token={token}',
+        'url': f'http://localhost:{port}/tree?token={token}',  # Changed from /lab to /tree
         'port': port,
         'token': token,
         'config_path': config_path
@@ -122,7 +121,7 @@ class DeleteNotebookRequest(BaseModel):
 
 @app.post("/create_notebook", status_code=201)
 def create_notebook():
-    """Endpoint to create a new JupyterLab notebook."""
+    """Endpoint to create a new Jupyter Notebook."""
     try:
         with containers_lock:
             notebook_info = create_jupyter_container()
@@ -132,8 +131,8 @@ def create_notebook():
                 'port': notebook_info['port'],
                 'token': notebook_info['token'],
                 'config_path': notebook_info['config_path'],
-                'url2': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}",
-                'url3': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-5000.app.github.dev/view.html?url=https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}"
+                'url2': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/tree?token={notebook_info['token']}",
+                'url3': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-5000.app.github.dev/view.html?url=https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/tree?token={notebook_info['token']}"
             }
         return {
             'status': 'success',
@@ -143,8 +142,8 @@ def create_notebook():
                 'url': notebook_info['url'],
                 'port': notebook_info['port'],
                 'token': notebook_info['token'],
-                'url2': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}",
-                'url3': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-5000.app.github.dev/view.html?url=https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}"
+                'url2': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/tree?token={notebook_info['token']}",
+                'url3': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-5000.app.github.dev/view.html?url=https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/tree?token={notebook_info['token']}"
             }
         }
     except Exception as e:
@@ -189,7 +188,7 @@ def query_notebooks():
 
 @app.delete("/delete_notebook")
 def delete_notebook(request: DeleteNotebookRequest):
-    """Endpoint to delete a specified JupyterLab notebook."""
+    """Endpoint to delete a specified Jupyter Notebook."""
     container_id = request.container_id
 
     try:
@@ -226,7 +225,7 @@ def delete_notebook(request: DeleteNotebookRequest):
 @app.get("/view_notebook/{container_id}")
 def view_notebook(container_id: str, request: Request):
     """
-    Serve an HTML page that embeds the JupyterLab instance in an iframe.
+    Serve an HTML page that embeds the Jupyter Notebook instance in an iframe.
     """
     with containers_lock:
         container_info = containers_info.get(container_id)
@@ -242,7 +241,7 @@ def index():
     return {
         'message': 'Jupyter Notebook Manager API',
         'endpoints': {
-            'POST /create_notebook': 'Create a new JupyterLab notebook',
+            'POST /create_notebook': 'Create a new Jupyter Notebook',
             'GET /query_notebooks': 'List all active notebooks',
             'DELETE /delete_notebook': 'Delete a specific notebook',
             'GET /view_notebook/{container_id}': 'View a notebook in an iframe'
@@ -251,4 +250,9 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=5000,
+        reload=True  # Enable auto-reload
+    )
