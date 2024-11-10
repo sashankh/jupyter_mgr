@@ -1,319 +1,254 @@
-from flask import Flask, request, jsonify
-from functools import wraps
 import docker
-import random
-import string
+import uuid
 import os
 import socket
-import logging
-from pathlib import Path
-import sys
-import signal
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from threading import Lock
 
-app = Flask(__name__)
+app = FastAPI()
 
-# =======================
-# Configuration Settings
-# =======================
+# Initialize templates
+templates = Jinja2Templates(directory="templates")
 
-# Docker image for Jupyter Notebooks
-JUPYTER_IMAGE = os.getenv('JUPYTER_IMAGE', 'jupyter/base-notebook:latest')
+# Initialize Docker client
+client = docker.from_env()
 
-# Port range for mapping Jupyter Notebook containers
-JUPYTER_PORT_START = int(os.getenv('JUPYTER_PORT_START', 9000))
-JUPYTER_PORT_END = int(os.getenv('JUPYTER_PORT_END', 9999))
+# Configuration
+JUPYTER_IMAGE = 'jupyter/datascience-notebook:latest'
+HOST_PORT_START = 8801  # Starting port number
+HOST_PORT_END = 8990    # Ending port number
+NOTES_DIR = os.path.abspath('./notebooks')
+CONFIGS_DIR = os.path.abspath('./configs')  # Directory for config files
+FRONTEND_DOMAIN = 'http://localhost:5000'  # Replace with your frontend's domain
 
-# Host IP address
-HOST_IP = os.getenv('HOST_IP', '0.0.0.0')
+# Ensure necessary directories exist
+os.makedirs(NOTES_DIR, exist_ok=True)
+os.makedirs(CONFIGS_DIR, exist_ok=True)
 
-# API key for authenticating requests
-API_KEY = os.getenv('API_KEY', 'your_secure_api_key')  # Replace with your actual API key
+# In-memory store for container info
+# Structure: {container_id: { 'name': ..., 'url': ..., 'port': ..., 'token': ..., 'config_path': ... }}
+containers_info = {}
+containers_lock = Lock()  # To handle concurrent access
 
-# Directory to store notebooks on the host
-NOTEBOOKS_DIR = Path(os.getenv('NOTEBOOKS_DIR', 'notebooks'))
-
-# Resource limits for Docker containers
-MAX_MEMORY = os.getenv('MAX_MEMORY', '2g')       # Example: '2g' for 2 Gigabytes
-CPU_QUOTA = int(os.getenv('CPU_QUOTA', 50000))   # Example: 50000 for 50% of a CPU core
-
-# =====================
-# Logger Initialization
-# =====================
-
-# Configure logging to output informational messages and above
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# =====================
-# Docker Client Setup
-# =====================
-
-try:
-    # Initialize Docker client from environment
-    client = docker.from_env()
-    client.ping()
-    logger.info("Docker client initialized successfully.")
-except docker.errors.DockerException as e:
-    logger.error(f"Failed to initialize Docker client: {e}")
-    sys.exit(1)  # Exit application if Docker is not available
-
-# =====================
-# Utility Functions
-# =====================
-
-def generate_random_string(length=8):
-    """
-    Generate a random string of fixed length.
-    
-    Args:
-        length (int): Length of the generated string.
-        
-    Returns:
-        str: Randomly generated string.
-    """
-    characters = string.ascii_lowercase + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
-
-def find_available_port(retries=5):
-    """
-    Find an available port within the specified range with a limited number of retries.
-    
-    Args:
-        retries (int): Number of attempts to find a free port.
-        
-    Returns:
-        int: Available port number.
-        
-    Raises:
-        RuntimeError: If no available port is found after the specified retries.
-    """
-    for _ in range(retries):
-        port = random.randint(JUPYTER_PORT_START, JUPYTER_PORT_END)
+def get_available_port():
+    """Find an available port between HOST_PORT_START and HOST_PORT_END."""
+    for port in range(HOST_PORT_START, HOST_PORT_END):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind((HOST_IP, port))
+                s.bind(('localhost', port))
                 return port
-            except OSError:
+            except socket.error:
                 continue
-    raise RuntimeError("No available ports found within the specified range after multiple attempts.")
+    raise Exception("No available ports")
 
-def require_api_key(f):
-    """
-    Decorator to enforce API key authentication.
-    
-    Args:
-        f (function): The route handler function to decorate.
-        
-    Returns:
-        function: The decorated function.
-    """
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        key = request.headers.get('x-api-key')
-        if key and key == API_KEY:
-            return f(*args, **kwargs)
-        else:
-            logger.warning("Unauthorized access attempt.")
-            return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    return decorated
+def generate_jupyter_config(config_path, frontend_domain):
+    """Generate a JupyterLab config file to allow embedding in iframes."""
+    config_content = f"""
+c = get_config()
 
-# =====================
-# Flask Routes
-# =====================
+# Allow specific origin to embed JupyterLab in an iframe
+c.NotebookApp.allow_origin = '{frontend_domain}'
+c.NotebookApp.allow_credentials = True
 
-@app.route('/create_notebook', methods=['POST'])
-@require_api_key
-def create_notebook():
-    """
-    Endpoint to create a new Jupyter Notebook instance.
-    
-    Returns:
-        JSON response containing notebook URL, container name, and port.
-    """
+# Update Tornado settings to adjust headers
+c.NotebookApp.tornado_settings = {{
+    'headers': {{
+        'Content-Security-Policy': "frame-ancestors 'self' {frontend_domain}",
+    }}
+}}
+
+# Optional: Disable some security features if necessary (use with caution)
+# c.NotebookApp.disable_check_xsrf = True
+"""
+    with open(config_path, 'w') as config_file:
+        config_file.write(config_content)
+
+def create_jupyter_container():
+    """Create and start a new JupyterLab Docker container with dynamic config."""
+    token = uuid.uuid4().hex  # Generate a unique token
+    port = get_available_port()
+
+    container_name = f'jupyterlab_{uuid.uuid4().hex[:8]}'
+
+    # Generate unique config file path
+    config_filename = f'jupyter_lab_config_{uuid.uuid4().hex[:8]}.py'
+    config_path = os.path.join(CONFIGS_DIR, config_filename)
+    generate_jupyter_config(config_path, FRONTEND_DOMAIN)
+
     try:
-        # Generate unique identifiers
-        unique_id = generate_random_string()
-        port = find_available_port()
-        container_name = f'jupyter-{unique_id}'
-
-        # Run the Jupyter Notebook Docker container
         container = client.containers.run(
             JUPYTER_IMAGE,
-            name=container_name,
-            ports={'8888/tcp': port},
             detach=True,
-            tty=True,
-            volumes={
-                str(NOTEBOOKS_DIR.resolve()): {
-                    'bind': '/home/jovyan/work',
-                    'mode': 'rw'
-                }
-            },
             environment={
-                'JUPYTER_TOKEN': '',  # To be addressed later for security
-                'GRANT_SUDO': 'yes',
+                'JUPYTER_ENABLE_LAB': 'yes',
+                'JUPYTER_TOKEN': token
             },
-            mem_limit=MAX_MEMORY,
-            cpu_quota=CPU_QUOTA,
-            labels={
-                'app': 'jupyter-notebook',
-                'managed_by': 'flask_app'
-            }
+            volumes={
+                NOTES_DIR: {'bind': '/home/jovyan/work', 'mode': 'rw'},
+                config_path: {'bind': '/home/jovyan/.jupyter/jupyter_lab_config.py', 'mode': 'ro'}
+            },
+            ports={'8888/tcp': port},
+            name=container_name,
+            restart_policy={"Name": "no"}
         )
-
-        logger.info(f"Started container '{container_name}' on port {port}.")
-
-        # Construct the notebook URL
-        notebook_url = f'http://{HOST_IP}:{port}/'
-
-        return jsonify({
-            'success': True,
-            'notebook_url': notebook_url,
-            'container_name': container_name,
-            'port': port
-        }), 201
-
     except docker.errors.APIError as e:
-        logger.error(f"Docker API error: {e}")
-        return jsonify({'success': False, 'error': 'Docker API error.'}), 500
-    except RuntimeError as e:
-        logger.error(e)
-        return jsonify({'success': False, 'error': str(e)}), 500
-    except Exception as e:
-        logger.exception("An unexpected error occurred.")
-        return jsonify({'success': False, 'error': 'An unexpected error occurred.'}), 500
+        # Clean up config file if container creation fails
+        if os.path.exists(config_path):
+            os.remove(config_path)
+        raise Exception(f"Docker API error: {str(e)}")
 
-@app.route('/list_notebooks', methods=['GET'])
-@require_api_key
-def list_notebooks():
-    """
-    Endpoint to list all active Jupyter Notebook instances.
-    
-    Returns:
-        JSON response containing a list of notebooks with their details.
-    """
-    try:
-        # Filter containers by labels for precise selection
-        containers = client.containers.list(all=True, filters={
-            'label': 'app=jupyter-notebook',
-            'label': 'managed_by=flask_app'
-        })
-        notebook_list = []
-        for container in containers:
-            ports = container.attrs['NetworkSettings']['Ports'].get('8888/tcp')
-            host_port = ports[0]['HostPort'] if ports else None
-            notebook_list.append({
-                'name': container.name,
-                'status': container.status,
-                'port': host_port,
-                'ip': container.attrs['NetworkSettings']['IPAddress']
-            })
-        return jsonify({'success': True, 'notebooks': notebook_list}), 200
-    except docker.errors.APIError as e:
-        logger.error(f"Docker API error: {e}")
-        return jsonify({'success': False, 'error': 'Docker API error.'}), 500
-    except Exception as e:
-        logger.exception("An unexpected error occurred.")
-        return jsonify({'success': False, 'error': 'An unexpected error occurred.'}), 500
+    return {
+        'container_id': container.id,
+        'name': container.name,
+        'url': f'http://localhost:{port}/lab?token={token}',
+        'port': port,
+        'token': token,
+        'config_path': config_path
+    }
 
-@app.route('/delete_notebook/<container_name>', methods=['DELETE'])
-@require_api_key
-def delete_notebook(container_name):
-    """
-    Endpoint to delete a specific Jupyter Notebook instance.
-    
-    Args:
-        container_name (str): The name of the Docker container to delete.
-        
-    Returns:
-        JSON response indicating success or failure.
-    """
+def cleanup_config(config_path):
+    """Delete the Jupyter config file."""
     try:
-        container = client.containers.get(container_name)
-        container.stop()
-        container.remove()
-        logger.info(f"Stopped and removed container '{container_name}'.")
-        return jsonify({'success': True, 'message': f'Container {container_name} stopped and removed.'}), 200
+        if os.path.exists(config_path):
+            os.remove(config_path)
+    except Exception as e:
+        print(f"Error deleting config file {config_path}: {e}")
+
+class DeleteNotebookRequest(BaseModel):
+    container_id: str
+
+@app.post("/create_notebook", status_code=201)
+def create_notebook():
+    """Endpoint to create a new JupyterLab notebook."""
+    try:
+        with containers_lock:
+            notebook_info = create_jupyter_container()
+            containers_info[notebook_info['container_id']] = {
+                'name': notebook_info['name'],
+                'url': notebook_info['url'],
+                'port': notebook_info['port'],
+                'token': notebook_info['token'],
+                'config_path': notebook_info['config_path'],
+                'url2': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}",
+                'url3': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-5000.app.github.dev/view.html?url=https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}"
+            }
+        return {
+            'status': 'success',
+            'data': {
+                'container_id': notebook_info['container_id'],
+                'name': notebook_info['name'],
+                'url': notebook_info['url'],
+                'port': notebook_info['port'],
+                'token': notebook_info['token'],
+                'url2': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}",
+                'url3': f"https://crispy-space-chainsaw-gwrg7vjq9h9w5v-5000.app.github.dev/view.html?url=https://crispy-space-chainsaw-gwrg7vjq9h9w5v-{notebook_info['port']}.app.github.dev/lab?token={notebook_info['token']}"
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/query_notebooks")
+def query_notebooks():
+    """Endpoint to retrieve all active notebooks."""
+    try:
+        with containers_lock:
+            # Optionally, verify if containers are still running
+            active_containers = []
+            to_remove = []
+            for cid, info in containers_info.items():
+                try:
+                    container = client.containers.get(cid)
+                    if container.status != 'running':
+                        to_remove.append(cid)
+                    else:
+                        active_containers.append({
+                            'container_id': cid,
+                            'name': info['name'],
+                            'url': info['url'],
+                            'port': info['port'],
+                            'token': info['token']
+                        })
+                except docker.errors.NotFound:
+                    to_remove.append(cid)
+
+            # Clean up non-running containers and their config files
+            for cid in to_remove:
+                config_path = containers_info[cid]['config_path']
+                cleanup_config(config_path)
+                del containers_info[cid]
+
+        return {
+            'status': 'success',
+            'data': active_containers
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/delete_notebook")
+def delete_notebook(request: DeleteNotebookRequest):
+    """Endpoint to delete a specified JupyterLab notebook."""
+    container_id = request.container_id
+
+    try:
+        with containers_lock:
+            container_info = containers_info.get(container_id)
+            if not container_info:
+                raise HTTPException(status_code=404, detail=f'Container with ID {container_id} not found.')
+
+            container = client.containers.get(container_id)
+            container.stop()
+            container.remove()
+
+            # Clean up config file
+            cleanup_config(container_info['config_path'])
+
+            del containers_info[container_id]
+
+        return {
+            'status': 'success',
+            'message': f'Container {container_id} deleted successfully.'
+        }
     except docker.errors.NotFound:
-        logger.warning(f"Container '{container_name}' not found.")
-        return jsonify({'success': False, 'error': 'Container not found.'}), 404
+        with containers_lock:
+            container_info = containers_info.get(container_id)
+            if container_info:
+                cleanup_config(container_info['config_path'])
+                del containers_info[container_id]
+        raise HTTPException(status_code=404, detail=f'Container with ID {container_id} not found.')
     except docker.errors.APIError as e:
-        logger.error(f"Docker API error: {e}")
-        return jsonify({'success': False, 'error': 'Docker API error.'}), 500
+        raise HTTPException(status_code=500, detail=f'Docker API error: {str(e)}')
     except Exception as e:
-        logger.exception("An unexpected error occurred.")
-        return jsonify({'success': False, 'error': 'An unexpected error occurred.'}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-# =====================
-# Initialization Function
-# =====================
-
-def init():
+@app.get("/view_notebook/{container_id}")
+def view_notebook(container_id: str, request: Request):
     """
-    Initialize the application environment by ensuring necessary directories exist
-    and pulling the required Docker image.
+    Serve an HTML page that embeds the JupyterLab instance in an iframe.
     """
-    try:
-        # Ensure notebooks directory exists
-        NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Ensured notebooks directory exists at {NOTEBOOKS_DIR.resolve()}.")
+    with containers_lock:
+        container_info = containers_info.get(container_id)
+        if not container_info:
+            raise HTTPException(status_code=404, detail=f'Container with ID {container_id} not found.')
+        jupyter_url = container_info['url']
 
-        # Pull the latest Jupyter Docker image
-        logger.info(f"Pulling Docker image '{JUPYTER_IMAGE}'...")
-        client.images.pull(JUPYTER_IMAGE)
-        logger.info(f"Docker image '{JUPYTER_IMAGE}' is ready.")
-    except docker.errors.APIError as e:
-        logger.error(f"Failed to pull Docker image '{JUPYTER_IMAGE}': {e}")
-        raise
-    except Exception as e:
-        logger.exception("Failed to initialize the application environment.")
-        raise
+    return templates.TemplateResponse("view_notebook.html", {"request": request, "jupyter_url": jupyter_url})
 
-# =====================
-# Graceful Shutdown Handling
-# =====================
+@app.get("/")
+def index():
+    """Simple index route."""
+    return {
+        'message': 'Jupyter Notebook Manager API',
+        'endpoints': {
+            'POST /create_notebook': 'Create a new JupyterLab notebook',
+            'GET /query_notebooks': 'List all active notebooks',
+            'DELETE /delete_notebook': 'Delete a specific notebook',
+            'GET /view_notebook/{container_id}': 'View a notebook in an iframe'
+        }
+    }
 
-def shutdown_handler(signum, frame):
-    """
-    Handle shutdown signals to gracefully stop and remove all Jupyter Notebook containers.
-    
-    Args:
-        signum (int): Signal number.
-        frame: Current stack frame.
-    """
-    logger.info("Shutting down Flask application. Stopping all Jupyter containers.")
-    try:
-        # Retrieve all containers managed by this application
-        containers = client.containers.list(all=True, filters={
-            'label': 'app=jupyter-notebook',
-            'label': 'managed_by=flask_app'
-        })
-        for container in containers:
-            try:
-                container.stop()
-                container.remove()
-                logger.info(f"Stopped and removed container '{container.name}'.")
-            except docker.errors.APIError as e:
-                logger.error(f"Error stopping/removing container '{container.name}': {e}")
-            except Exception as e:
-                logger.error(f"Unexpected error stopping/removing container '{container.name}': {e}")
-    except Exception as e:
-        logger.error(f"Error during shutdown cleanup: {e}")
-    finally:
-        sys.exit(0)
-
-# Register signal handlers for graceful shutdown
-signal.signal(signal.SIGINT, shutdown_handler)   # Handle Ctrl+C
-signal.signal(signal.SIGTERM, shutdown_handler)  # Handle termination signals
-
-# =====================
-# Application Entry Point
-# =====================
-
-if __name__ == '__main__':
-    try:
-        init()
-        app.run(host=HOST_IP, port=8000, debug=False)
-    except Exception as e:
-        logger.error(f"Application failed to start: {e}")
-        sys.exit(1)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
